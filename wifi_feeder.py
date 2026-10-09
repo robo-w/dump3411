@@ -22,9 +22,12 @@ Requirements:
 """
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
+import json
 import logging
 import os
+import re
 import signal
 import socket
 import struct
@@ -38,10 +41,6 @@ if TYPE_CHECKING:                       # avoid hard import — feeder must run 
     from tracker import Tracker
 
 # -- Logging -------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
 log = logging.getLogger("dump3411.wifi")
 
 
@@ -168,6 +167,12 @@ def parse_location(data: bytes) -> dict:
     # Reject placeholder GPS broadcast before lock (e.g. DJI firmware transmits
     # lat>90 or lon>180 as a sentinel until GPS acquires).
     if abs(lat) > 90.0 or abs(lon) > 180.0:
+        log.verbose(f"Rejecting out-of-range lat/lon: {lat}, {lon}")
+        return {}
+
+    # DJI O4 drone sends a heading of 361.0 when no satellites are present.
+    if heading >= 360.0:
+        log.verbose(f"Rejecting out-of-range heading: {heading}")
         return {}
 
     geodetic_alt = struct.unpack_from('<H', data, 15)[0] * 0.5 - 1000.0
@@ -181,11 +186,13 @@ def parse_location(data: bytes) -> dict:
         "heading":        round(heading, 1),
         "height_type":    "AGL" if height_type == 1 else "Above Takeoff",
     }
+
     # uint16 value 0x0000 decodes to −1000.0 m, the ODID "unknown" sentinel.
     if geodetic_alt > -1000.0:
         result["altitude_geo"] = round(geodetic_alt, 1)
     if height_m > -1000.0:
         result["height_agl"] = round(height_m, 1)
+
     return result
 
 
@@ -226,16 +233,36 @@ def parse_system_msg(data: bytes) -> dict:
     # -1000.0 m is the ODID "unknown" altitude sentinel.
     if alt_takeoff > -1000.0:
         result["alt_takeoff_geo"] = round(alt_takeoff, 1)
+
     return result
 
 
 def parse_operator_id(data: bytes) -> dict:
     if len(data) < 22:
         return {}
-    return {
-        "operator_id_type": data[1],
-        "operator_id":      data[2:22].rstrip(b'\x00').decode('ascii', errors='replace'),
+
+    operator_id_type = data[1]
+    operator_id_str = data[2:22].rstrip(b'\x00').decode('ascii', errors='replace')
+
+    if operator_id_type == 0:
+        operator_id_type_classification = "Operator ID"
+    elif operator_id_type <= 200:
+        operator_id_type_classification = "Reserved"
+    else:
+        operator_id_type_classification = "Private Use"
+
+    result: dict = {
+        "operator_id_type": operator_id_type,
+        "operator_id_type_classification": operator_id_type_classification,
+        "operator_id": operator_id_str
     }
+
+    if re.fullmatch(r"[A-Z]{3}[a-z0-9]{12}", operator_id_str):
+        # Checks whether the format matches the EU operator registration format:
+        # Uppercase country code, followed by 12 alphanumeric characters.
+        result["operator_id_eu_formatted"] = True
+
+    return result
 
 
 def parse_self_id(data: bytes) -> dict:
@@ -275,20 +302,29 @@ def decode_rid_message(raw_bytes: bytes) -> dict | None:
         return None
     msg_type  = (raw_bytes[0] >> 4) & 0x0F
     type_name = MSG_TYPE.get(msg_type, f"Unknown(0x{msg_type:X})")
-    result    = {"message_type": type_name, "raw_hex": raw_bytes.hex().upper()}
-    if msg_type == 0x0:
-        result.update(parse_basic_id(raw_bytes))
-    elif msg_type == 0x1:
-        result.update(parse_location(raw_bytes))
-    elif msg_type == 0x3:
-        result.update(parse_self_id(raw_bytes))
-    elif msg_type == 0x4:
-        result.update(parse_system_msg(raw_bytes))
-    elif msg_type == 0x5:
-        result.update(parse_operator_id(raw_bytes))
-    elif msg_type == 0xF:
-        sub_msgs = parse_message_pack(raw_bytes)
-        result["messages"] = [m for m in (decode_rid_message(s) for s in sub_msgs) if m]
+    utc_now_str = datetime.now(timezone.utc).isoformat()
+    result    = {
+        "decoded_at": utc_now_str,
+        "message_type": type_name,
+        "message_type_raw": msg_type,
+        "raw_hex": raw_bytes.hex().upper()
+    }
+
+    match msg_type:
+        case 0x0:
+            result.update(parse_basic_id(raw_bytes))
+        case 0x1:
+            result.update(parse_location(raw_bytes))
+        case 0x3:
+            result.update(parse_self_id(raw_bytes))
+        case 0x4:
+            result.update(parse_system_msg(raw_bytes))
+        case 0x5:
+            result.update(parse_operator_id(raw_bytes))
+        case 0xF:
+            sub_msgs = parse_message_pack(raw_bytes)
+            result["messages"] = [m for m in (decode_rid_message(s) for s in sub_msgs) if m]
+
     return result
 
 
@@ -358,8 +394,8 @@ def _parse_dot11_mgmt(data: bytes) -> tuple[int, str, int] | None:
     """
     Parse an 802.11 management frame MAC header.
 
-    Returns (subtype, addr2_mac_str, body_offset) or None if not a mgmt frame.
-    addr2 is the transmitter (Source Address).
+    Returns (subtype, source_mac_str, body_offset) or None if not a mgmt frame.
+    source_mac_str is the transmitter (Source Address).
     Management frames have a fixed 24-byte MAC header.
     """
     if len(data) < 24:
@@ -369,8 +405,8 @@ def _parse_dot11_mgmt(data: bytes) -> tuple[int, str, int] | None:
     frame_subtype = (fc0 >> 4) & 0xF
     if frame_type != 0:          # 0 = management
         return None
-    addr2 = _mac_str(data[10:16])
-    return frame_subtype, addr2, 24
+    source_mac_str = _mac_str(data[10:16])
+    return frame_subtype, source_mac_str, 24
 
 
 def _extract_beacon_rid(body: bytes) -> bytes | None:
@@ -587,15 +623,20 @@ def _ensure_monitor_safe(iface: str):
         pass
 
 
-def set_monitor_mode(iface: str):
+def set_monitor_mode(iface: str) -> bool:
     """Bring interface up in monitor mode."""
     _ensure_monitor_safe(iface)
     log.info(f"Setting {iface} to monitor mode...")
-    subprocess.run(["rfkill", "unblock", "all"], check=False, capture_output=True)
-    subprocess.run(["ip", "link", "set", iface, "down"], check=True)
-    subprocess.run(["iw", "dev", iface, "set", "type", "monitor"], check=True)
-    subprocess.run(["ip", "link", "set", iface, "up"], check=True)
-    log.info(f"{iface} is now in monitor mode")
+    try:
+        subprocess.run(["rfkill", "unblock", "all"], check=False, capture_output=True)
+        subprocess.run(["ip", "link", "set", iface, "down"], check=True)
+        subprocess.run(["iw", "dev", iface, "set", "type", "monitor"], check=True)
+        subprocess.run(["ip", "link", "set", iface, "up"], check=True)
+        log.info(f"{iface} is now in monitor mode")
+        return True
+    except Exception as e:
+        log.warning(f"Could not set monitor mode: {e}")
+        return False
 
 
 def restore_managed_mode(iface: str):
@@ -628,6 +669,12 @@ class ChannelHopper(threading.Thread):
         self.channels = channels
         self.dwell    = dwell
         self._stop    = threading.Event()
+        self._channel_lock = threading.Lock()
+        self._current_channel: int | None = None
+
+    def get_current_channel(self) -> int | None:
+        with self._channel_lock:
+            return self._current_channel
 
     def run(self):
         log.info(f"Channel hopper started: {self.channels} @ {self.dwell}s dwell")
@@ -636,6 +683,8 @@ class ChannelHopper(threading.Thread):
                 if self._stop.is_set():
                     break
                 set_channel(self.iface, ch)
+                with self._channel_lock:
+                    self._current_channel = ch
                 time.sleep(self.dwell)
 
     def stop(self):
@@ -646,7 +695,8 @@ class ChannelHopper(threading.Thread):
 
 class WiFiFeeder:
     def __init__(self, iface: str, verbose: bool = False, channel_dwell: float = 0.2,
-                 channel: int | None = None, tracker: "Tracker | None" = None):
+                 channel: int | None = None, tracker: "Tracker | None" = None,
+                 message_log_file_path: str | None = None):
         self.iface     = iface
         self.verbose   = verbose
         self.tracker   = tracker      # optional; when set, decoded messages also feed it
@@ -655,9 +705,69 @@ class WiFiFeeder:
             ChannelHopper(iface, CHANNELS_24, channel_dwell)
         self.count     = 0
         self.nan_count = 0
+        self.dropped_rid_count = 0
+        self.message_log_file_path = message_log_file_path
+        self.message_log_file = None
         self._stop     = threading.Event()  # for orderly shutdown from another thread
 
+    @staticmethod
+    def _build_rid_detail_string(msg: dict) -> str:
+        if not msg:
+            return ""
+
+        uas_id = msg.get("uas_id")
+        uas_id_type = msg.get("id_type", "")
+
+        operator_id = msg.get("operator_id")
+        operator_id_eu_formatted = msg.get("operator_id_eu_formatted", False)
+
+        ua_type = msg.get("ua_type")
+
+        lat    = msg.get("latitude")
+        lon    = msg.get("longitude")
+        desc   = msg.get("description")
+
+        detail = ""
+        if uas_id is not None:
+            detail += f"\n  UAS-ID: '{uas_id}' ({uas_id_type})"
+        if ua_type is not None:
+            detail += f"\n  UA Type: '{ua_type}'"
+        if operator_id is not None:
+            detail += f"\n  Operator ID: '{operator_id}'"
+        if operator_id_eu_formatted:
+            detail += f"  (EU format)"
+        if lat is not None:
+            detail += f"\n  Location: lat={lat} lon={lon}"
+        if desc is not None:
+            detail += f"\n  Description: '{desc}'"
+
+        return detail
+
+
+    @staticmethod
+    def _unpack_to_sub_messages(decoded: dict) -> list:
+        if decoded.get("message_type") == "Message Pack":
+            sub_messages = decoded.get("messages", [])
+            log.debug(f"Unpacked {len(sub_messages)} sub-messages from Message Pack")
+
+            # 'Basic ID' (0x01) should be processed first within a pack, so the
+            # tracker's MAC to uas_id mapping is in place when Location /
+            # System / Operator-ID arrive in the same beacon.
+            sub_messages = sorted(
+                sub_messages,
+                key=lambda m: m.get("message_type_raw", 0xFF),
+            )
+        else:
+            sub_messages = [decoded]
+
+        return sub_messages
+
     def _on_packet(self, data: bytes):
+        if self.hopper:
+            current_channel = self.hopper.get_current_channel()
+        else:
+            current_channel = self.channel
+
         rt_len, rssi = _parse_radiotap(data)
         if rt_len >= len(data):
             return
@@ -667,7 +777,7 @@ class WiFiFeeder:
         if header is None:
             return
 
-        subtype, addr2, body_offset = header
+        subtype, source_mac_str, body_offset = header
         body = mac_data[body_offset:]
 
         # ---- Wi-Fi Beacon Remote ID (subtype 8) ----
@@ -680,51 +790,14 @@ class WiFiFeeder:
             if decoded is None:
                 return
 
-            if decoded.get("message_type") == "Message Pack":
-                sub_messages = decoded.get("messages", [])
-            else:
-                sub_messages = [decoded]
-
-            # Process Basic ID first within a pack so the tracker's MAC →
-            # uas_id mapping is in place when Location / System / Operator-ID
-            # arrive in the same beacon.
-            sub_messages = sorted(
-                sub_messages,
-                key=lambda m: 0 if m.get("message_type") == "Basic ID" else 1,
-            )
-
+            sub_messages = self._unpack_to_sub_messages(decoded)
             for msg in sub_messages:
-                mtype = msg.get("message_type", "?")
-                # Drop Location/Vector messages with no valid GPS fix.
-                if mtype == "Location/Vector" and "latitude" not in msg:
-                    continue
-                self.count += 1
+                self._on_rid_message(msg, source_mac_str, rssi, current_channel, rid_source="WiFi-Beacon")
 
-                # Feed the per-drone tracker if one was injected.
-                if self.tracker is not None:
-                    self._update_tracker(addr2, mtype, msg, rssi)
-
-                if self.verbose or mtype in ("Basic ID", "Location/Vector", "Self ID"):
-                    uas_id = msg.get("uas_id", "")
-                    lat    = msg.get("latitude")
-                    lon    = msg.get("longitude")
-                    desc   = msg.get("description")
-                    if uas_id:
-                        detail = f"UAS-ID={uas_id}"
-                    elif lat is not None:
-                        detail = f"lat={lat} lon={lon}"
-                    elif desc:
-                        detail = f'Description="{desc}"'
-                    else:
-                        detail = ""
-                    log.info(
-                        f"[WiFi-Beacon] MAC={addr2}  RSSI={rssi}dBm  "
-                        f"Type={mtype}  {detail}"
-                    )
             return
 
         # ---- Wi-Fi NAN Remote ID (subtype 13 — action frame) ----
-        if subtype == 13 and _is_nan_action(body):
+        elif subtype == 13 and _is_nan_action(body):
             self.nan_count += 1
 
             rid_payload = _extract_nan_odid(body)
@@ -734,7 +807,7 @@ class WiFiFeeder:
                 # NAN-broadcasting drone shows up and our spec interpretation
                 # is slightly off, we have hex evidence to fix the parser.
                 log.warning(
-                    f"[WiFi-NAN] MAC={addr2}  RSSI={rssi}dBm  "
+                    f"[WiFi-NAN] MAC={source_mac_str}  RSSI={rssi}dBm  "
                     f"matched NAN Service ID but SDA didn't parse; "
                     f"body[:80]={body.hex().upper()[:160]}"
                 )
@@ -744,46 +817,41 @@ class WiFiFeeder:
             if decoded is None:
                 return
 
-            if decoded.get("message_type") == "Message Pack":
-                sub_messages = decoded.get("messages", [])
-            else:
-                sub_messages = [decoded]
-
-            # Same Basic-ID-first ordering as the beacon branch — the tracker
-            # needs the MAC → uas_id mapping in place before Location/System
-            # arrive in the same pack.
-            sub_messages = sorted(
-                sub_messages,
-                key=lambda m: 0 if m.get("message_type") == "Basic ID" else 1,
-            )
-
+            sub_messages = self._unpack_to_sub_messages(decoded)
             for msg in sub_messages:
-                mtype = msg.get("message_type", "?")
-                if mtype == "Location/Vector" and "latitude" not in msg:
-                    continue
-                self.count += 1
+                self._on_rid_message(msg, source_mac_str, rssi, current_channel, rid_source="WiFi-NAN")
 
-                if self.tracker is not None:
-                    self._update_tracker(addr2, mtype, msg, rssi,
-                                         rid_source="wifi_nan")
 
-                if self.verbose or mtype in ("Basic ID", "Location/Vector", "Self ID"):
-                    uas_id = msg.get("uas_id", "")
-                    lat    = msg.get("latitude")
-                    lon    = msg.get("longitude")
-                    desc   = msg.get("description")
-                    if uas_id:
-                        detail = f"UAS-ID={uas_id}"
-                    elif lat is not None:
-                        detail = f"lat={lat} lon={lon}"
-                    elif desc:
-                        detail = f'Description="{desc}"'
-                    else:
-                        detail = ""
-                    log.info(
-                        f"[WiFi-NAN] MAC={addr2}  RSSI={rssi}dBm  "
-                        f"Type={mtype}  {detail}"
-                    )
+    def _on_rid_message(self, msg, source_mac_str, rssi, current_channel, rid_source):
+        mtype_raw = msg.get("message_type_raw", 0xFF)
+        mtype = msg.get("message_type", "?")
+
+        # Writing message to JSONL log before dropping any messages due to consistency checks
+        if self.message_log_file is not None:
+            try:
+                self.message_log_file.write(f"{json.dumps(msg, ensure_ascii=False)}\n")
+            except Exception as e:
+                log.warning(f"Could not write to message log file '{self.message_log_file_path}': {e}")
+
+        if mtype_raw == 0x01 and "latitude" not in msg:
+            log.debug("Dropping 'Location/Vector' with no GPS fix")
+            self.dropped_rid_count += 1
+            return
+
+        self.count += 1
+
+        # Feed the per-drone tracker if one was injected.
+        if self.tracker is not None:
+            self._update_tracker(source_mac_str, mtype, msg, rssi, rid_source=rid_source)
+
+        if mtype_raw == 0x00 and not self.verbose:
+            log.info(f"[{rid_source}]  MAC={source_mac_str}  RSSI={rssi}dBm  Type=0x{mtype_raw:02x}:'{mtype}'")
+
+        detail_str = WiFiFeeder._build_rid_detail_string(msg)
+        log.debug(
+            f"[{rid_source}] ch={current_channel} MAC={source_mac_str} RSSI={rssi}dBm "
+            f"Type=0x{mtype_raw:02x}:'{mtype}' {detail_str}"
+        )
 
     def _update_tracker(self, mac: str, mtype: str, msg: dict, rssi,
                         rid_source: str = "wifi_beacon") -> None:
@@ -833,22 +901,34 @@ class WiFiFeeder:
     def _heartbeat_loop(self):
         while True:
             time.sleep(60)
-            log.info(f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}")
+            log.info(f"[Heartbeat] Beacon RID={self.count}  NAN={self.nan_count}  Dropped RIDs={self.dropped_rid_count}")
 
     def stop(self) -> None:
         """Signal run() to exit; restore_managed_mode() runs in the finally."""
         self._stop.set()
 
     def run(self):
-        log.info(f"dump3411 WiFi detector — interface {self.iface}")
+        log.info(f"dump3411 WiFi detector - listening on interface '{self.iface}'")
 
-        set_monitor_mode(self.iface)
+        if not set_monitor_mode(self.iface):
+            log.error("Failed to set monitor mode; exiting.")
+            return
+
         if self.hopper is not None:
             log.info(f"Channels: {CHANNELS_24}")
             self.hopper.start()
         else:
             log.info(f"Fixed channel: {self.channel} (hopping disabled)")
             set_channel(self.iface, self.channel)
+
+        if self.message_log_file_path:
+            try:
+                self.message_log_file = open(
+                    self.message_log_file_path, "a", encoding="utf-8"
+                )
+            except Exception as e:
+                log.warning(f"Could not open message log file '{self.message_log_file_path}': {e}")
+                self.message_log_file = None
 
         log.info("Scanning for Remote ID beacon frames (ASTM F3411)...")
 
@@ -869,10 +949,19 @@ class WiFiFeeder:
             log.info("Stopped.")
         finally:
             sock.close()
+
             if self.hopper is not None:
                 self.hopper.stop()
+
+            if self.message_log_file is not None:
+                try:
+                    self.message_log_file.flush()
+                    self.message_log_file.close()
+                except Exception as e:
+                    log.warning(f"Could not close message log file '{self.message_log_file_path}': {e}")
+
             restore_managed_mode(self.iface)
-            log.info(f"[Summary] Beacon RID={self.count}  NAN frames={self.nan_count}")
+            log.info(f"[Summary] Beacon RID={self.count}  NAN frames={self.nan_count}  Dropped RIDs={self.dropped_rid_count}")
 
 
 def _handle_sigterm(signum, frame):
@@ -900,6 +989,10 @@ def main():
         "--verbose", "-v", action="store_true",
         help="Log every decoded message and NAN frame"
     )
+    parser.add_argument(
+        "--message-log-file", default=None,
+        help="Append decoded messages in JSONL format to this file"
+    )
     args = parser.parse_args()
 
     if args.channel is not None and args.channel not in CHANNELS_24:
@@ -907,11 +1000,18 @@ def main():
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
     feeder = WiFiFeeder(
         iface=args.iface,
         verbose=args.verbose,
         channel_dwell=args.channel_dwell,
         channel=args.channel,
+        message_log_file_path=args.message_log_file,
     )
     feeder.run()
 

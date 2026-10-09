@@ -1,5 +1,5 @@
 [Unit]
-Description=dump3411 Remote ID detector + JSON feed (offline)
+Description=dump3411 Offline Remote ID detector and JSON feed
 After=bluetooth.target network-online.target
 Wants=bluetooth.target network-online.target
 
@@ -7,8 +7,8 @@ Wants=bluetooth.target network-online.target
 Type=simple
 # Optional env file for MQTT (and any other env-var-driven settings).
 # Leading `-` makes it optional: nothing happens if it doesn't exist. Drop a
-# /etc/dump3411.env with `MQTT_BROKER=mqtt.lan:1883` etc. to enable MQTT.
-EnvironmentFile=-/etc/dump3411.env
+# /etc/default/dump3411 with `MQTT_BROKER=mqtt.lan:1883` etc. to enable MQTT.
+EnvironmentFile=-/etc/default/dump3411
 ExecStart=/usr/bin/python3 /home/pi/dump3411/dump3411.py --wifi-iface wlan1 --serve 0.0.0.0:8754
 Restart=on-failure
 RestartSec=5
