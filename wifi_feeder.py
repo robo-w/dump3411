@@ -792,7 +792,7 @@ class WiFiFeeder:
 
             sub_messages = self._unpack_to_sub_messages(decoded)
             for msg in sub_messages:
-                self._on_rid_message(msg, source_mac_str, rssi, current_channel, rid_source="WiFi-Beacon")
+                self._on_rid_message(msg, source_mac_str, rssi, current_channel, rid_source="wifi_beacon")
 
             return
 
@@ -819,7 +819,7 @@ class WiFiFeeder:
 
             sub_messages = self._unpack_to_sub_messages(decoded)
             for msg in sub_messages:
-                self._on_rid_message(msg, source_mac_str, rssi, current_channel, rid_source="WiFi-NAN")
+                self._on_rid_message(msg, source_mac_str, rssi, current_channel, rid_source="wifi_nan")
 
 
     def _on_rid_message(self, msg, source_mac_str, rssi, current_channel, rid_source):
@@ -848,8 +848,14 @@ class WiFiFeeder:
             log.info(f"[{rid_source}]  MAC={source_mac_str}  RSSI={rssi}dBm  Type=0x{mtype_raw:02x}:'{mtype}'")
 
         detail_str = WiFiFeeder._build_rid_detail_string(msg)
+        rid_source_str = rid_source
+        if rid_source == "wifi_beacon":
+            rid_source_str = "WiFi-Beacon"
+        elif rid_source == "wifi_nan":
+            rid_source_str = "WiFi-NAN"
+
         log.debug(
-            f"[{rid_source}] ch={current_channel} MAC={source_mac_str} RSSI={rssi}dBm "
+            f"[{rid_source_str}] ch={current_channel} MAC={source_mac_str} RSSI={rssi}dBm "
             f"Type=0x{mtype_raw:02x}:'{mtype}' {detail_str}"
         )
 
