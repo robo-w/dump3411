@@ -22,7 +22,7 @@ Requirements:
 """
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -110,6 +110,13 @@ OPERATOR_LOCATION_TYPE = {
     2: "fixed",
 }
 
+UA_OPERATIONAL_STATUS = {
+    0: "Undeclared",
+    1: "Ground",
+    2: "Airborne",
+    3: "Emergency",
+}
+
 
 # -- Remote ID Decoder ---------------------------------------------------------
 
@@ -146,7 +153,11 @@ def parse_location(data: bytes) -> dict:
       bytes 13-14:   Pressure Altitude  (uint16 × 0.5 − 1000 m)
       bytes 15-16:   Geodetic Altitude  (uint16 × 0.5 − 1000 m)
       bytes 17-18:   Height (AGL/takeoff) (uint16 × 0.5 − 1000 m)
-      byte 19+:      accuracies, timestamp, reserved — not decoded
+      byte 19:       Horizontal/Vertical accuracy
+      byte 20:       Baro altitude/Speed accuracy
+      bytes 21-22:   Time of applicability (uint16 × 0.1 s since UTC hour)
+      byte 23:       Timestamp accuracy
+      byte 24:       Reserved
     """
     if len(data) < 25:
         return {}
@@ -154,6 +165,12 @@ def parse_location(data: bytes) -> dict:
     speed_mult  = data[1] & 0x01
     dir_segment = (data[1] >> 1) & 0x01
     height_type = (data[1] >> 2) & 0x01
+    oper_status = (data[1] >> 4) & 0x0F
+    oper_status_str = UA_OPERATIONAL_STATUS.get(oper_status, f"Reserved({oper_status})")
+
+    result = {
+        "operational_status": oper_status_str,
+    }
 
     heading = float(data[2]) + (180.0 if dir_segment else 0.0)
     # Above 255 * 0.25 = 63.75 m/s the encoding switches to 0.75 m/s steps
@@ -164,34 +181,49 @@ def parse_location(data: bytes) -> dict:
     lat = struct.unpack_from('<i', data, 5)[0] * 1e-7
     lon = struct.unpack_from('<i', data, 9)[0] * 1e-7
 
-    # Reject placeholder GPS broadcast before lock (e.g. DJI firmware transmits
+    # Reject placeholder GPS broadcast before lock (some? DJI firmware transmits
     # lat>90 or lon>180 as a sentinel until GPS acquires).
     if abs(lat) > 90.0 or abs(lon) > 180.0:
-        log.verbose(f"Rejecting out-of-range lat/lon: {lat}, {lon}")
-        return {}
+        log.debug(f"Skipping lat/lon for invalid data: {lat}, {lon}")
+    # Reject placeholder GPS broadcast of exactly 0.0/0.0 (DJI O4, Parrot)
+    elif abs(lat) == 0.0 and abs(lon) == 0.0:
+        log.debug("Skipping lat/lon 0.0/0.0 placeholder")
+    else:
+        result["latitude"]  = round(lat, 7)
+        result["longitude"] = round(lon, 7)
 
-    # DJI O4 drone sends a heading of 361.0 when no satellites are present.
-    if heading >= 360.0:
-        log.verbose(f"Rejecting out-of-range heading: {heading}")
-        return {}
+    # DJI drone sends a heading of 361.0 when drone does not move in any direction.
+    if heading == 361.0:
+        # DJI - no movement
+        pass
+    elif heading >= 360.0:
+        log.debug(f"Skipping heading for invalid data: {heading}")
+    else:
+        result["heading"] = round(heading, 1)
+        result["ground_speed"] = round(speed, 2)
+
+    result["vertical_speed"] = round(vspeed, 2)
+    result["height_type"] = "AGL" if height_type == 1 else "Above Takeoff"
 
     geodetic_alt = struct.unpack_from('<H', data, 15)[0] * 0.5 - 1000.0
     height_m     = struct.unpack_from('<H', data, 17)[0] * 0.5 - 1000.0
 
-    result = {
-        "latitude":       round(lat, 7),
-        "longitude":      round(lon, 7),
-        "ground_speed":   round(speed, 2),
-        "vertical_speed": round(vspeed, 2),
-        "heading":        round(heading, 1),
-        "height_type":    "AGL" if height_type == 1 else "Above Takeoff",
-    }
-
     # uint16 value 0x0000 decodes to −1000.0 m, the ODID "unknown" sentinel.
     if geodetic_alt > -1000.0:
         result["altitude_geo"] = round(geodetic_alt, 1)
+
     if height_m > -1000.0:
         result["height_agl"] = round(height_m, 1)
+
+    timestamp_raw = struct.unpack_from('<H', data, 21)[0]
+    if timestamp_raw != 0xFFFF and timestamp_raw <= 35999:
+        hour_start = datetime.now(timezone.utc).replace(
+            minute=0, second=0, microsecond=0
+        )
+        timestamp_iso = (
+            hour_start + timedelta(seconds=timestamp_raw / 10.0)
+        ).isoformat()
+        result["timestamp"] = timestamp_iso
 
     return result
 
