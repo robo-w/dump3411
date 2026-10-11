@@ -117,6 +117,31 @@ UA_OPERATIONAL_STATUS = {
     3: "Emergency",
 }
 
+SYSTEM_CLASSIFICATION_TYPE = {
+    0: "Undeclared",
+    1: "EU",
+    # Reserved 2-7
+}
+
+UA_EU_CATEGORY = {
+    0: "Undefined",
+    1: "Open",
+    2: "Specific",
+    3: "Certified",
+    # Reserved 4-15
+}
+
+UA_EU_CLASS = {
+    0: "Undefined",
+    1: "C0",
+    2: "C1",
+    3: "C2",
+    4: "C3",
+    5: "C4",
+    6: "C5",
+    7: "C6",
+    # Reserved 8-15
+}
 
 # -- Remote ID Decoder ---------------------------------------------------------
 
@@ -168,7 +193,7 @@ def parse_location(data: bytes) -> dict:
     oper_status = (data[1] >> 4) & 0x0F
     oper_status_str = UA_OPERATIONAL_STATUS.get(oper_status, f"Reserved({oper_status})")
 
-    result = {
+    result: dict = {
         "operational_status": oper_status_str,
     }
 
@@ -246,6 +271,7 @@ def parse_system_msg(data: bytes) -> dict:
     if len(data) < 20:
         return {}
     loc_type    = data[1] & 0x03
+    class_type  = (data[1] >> 2) & 0x07
     op_lat      = struct.unpack_from('<i', data,  2)[0] * 1e-7
     op_lon      = struct.unpack_from('<i', data,  6)[0] * 1e-7
     area_count  = struct.unpack_from('<H', data, 10)[0]
@@ -255,13 +281,26 @@ def parse_system_msg(data: bytes) -> dict:
     result: dict = {
         "area_count":    area_count,
         "area_radius_m": area_radius,
+        "classification_type": SYSTEM_CLASSIFICATION_TYPE.get(class_type, f"Reserved({class_type})"),
     }
-    # Spec ranges: lat ∈ [-90, 90], lon ∈ [-180, 180]. Out-of-range values are
-    # placeholder/sentinel — keep them out of the feed rather than emit 152° N.
-    if abs(op_lat) <= 90.0 and abs(op_lon) <= 180.0:
+
+    if class_type == 1:
+        ua_category = (data[17] >> 4) & 0x0F
+        ua_class    = data[17] & 0x0F
+        result["ua_category"] = UA_EU_CATEGORY.get(ua_category, f"Reserved({ua_category})")
+        result["ua_class"]    = UA_EU_CLASS.get(ua_class, f"Reserved({ua_class})")
+
+    if abs(op_lat) == 0.0 and abs(op_lon) == 0.0:
+        # Special values as invalid, no value, or unknown are
+        # coded with 0 deg (both for lat and lon)
+        log.debug("Skipping operator lat/lon 0.0/0.0 placeholder")
+    elif abs(op_lat) <= 90.0 and abs(op_lon) <= 180.0:
+        # Spec ranges: lat ∈ [-90, 90], lon ∈ [-180, 180]. Out-of-range values are
+        # placeholder/sentinel — keep them out of the feed rather than emit 152° N.
         result["operator_lat"]           = round(op_lat, 7)
         result["operator_lon"]           = round(op_lon, 7)
         result["operator_location_type"] = OPERATOR_LOCATION_TYPE.get(loc_type, "reserved")
+
     # -1000.0 m is the ODID "unknown" altitude sentinel.
     if alt_takeoff > -1000.0:
         result["alt_takeoff_geo"] = round(alt_takeoff, 1)
@@ -289,9 +328,9 @@ def parse_operator_id(data: bytes) -> dict:
         "operator_id": operator_id_str
     }
 
-    if re.fullmatch(r"[A-Z]{3}[a-z0-9]{12}", operator_id_str):
+    if re.fullmatch(r"[A-Z]{3}[a-z0-9]{13}", operator_id_str):
         # Checks whether the format matches the EU operator registration format:
-        # Uppercase country code, followed by 12 alphanumeric characters.
+        # Uppercase country code, followed by 13 alphanumeric characters.
         result["operator_id_eu_formatted"] = True
 
     return result
@@ -301,7 +340,7 @@ def parse_self_id(data: bytes) -> dict:
     """Parse a Self-ID message (msg type 0x3) per ASTM F3411 (25 bytes).
 
       byte 0:        msg_type<<4 | version    (caller has consumed)
-      byte 1:        Description Type (0 = text, 1 = emergency, 2 = extended)
+      byte 1:        Description Type (0 = Text, 1-200 Reserved, 201-255 Private Use)
       bytes 2-24:    Description (23 bytes ASCII, null-padded)
 
     Free-text "purpose of flight" string. Common examples: "Search and
