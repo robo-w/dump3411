@@ -368,18 +368,21 @@ def parse_message_pack(data: bytes) -> list:
     return messages
 
 
-def decode_rid_message(raw_bytes: bytes) -> dict | None:
+def decode_rid_message(raw_bytes: bytes, ssid: str = None) -> dict | None:
     if len(raw_bytes) < 2:
         return None
     msg_type  = (raw_bytes[0] >> 4) & 0x0F
     type_name = MSG_TYPE.get(msg_type, f"Unknown(0x{msg_type:X})")
     utc_now_str = datetime.now(timezone.utc).isoformat()
-    result    = {
+    result: dict = {
         "decoded_at": utc_now_str,
         "message_type": type_name,
         "message_type_raw": msg_type,
         "raw_hex": raw_bytes.hex().upper()
     }
+
+    if ssid is not None:
+        result["ssid"] = ssid
 
     match msg_type:
         case 0x0:
@@ -480,7 +483,7 @@ def _parse_dot11_mgmt(data: bytes) -> tuple[int, str, int] | None:
     return frame_subtype, source_mac_str, 24
 
 
-def _extract_beacon_rid(body: bytes) -> bytes | None:
+def _extract_beacon_rid(body: bytes) -> dict | None:
     """
     Walk 802.11 beacon Information Elements looking for the vendor-specific
     ASTM F3411 Remote ID payload (OUI FA:0B:BC, type 0x0D).
@@ -498,19 +501,27 @@ def _extract_beacon_rid(body: bytes) -> bytes | None:
     msg_type byte — every downstream field shifts by one and the uas_id grows
     leading control bytes. Strip the counter too.
 
-    Returns the ODID message (single message or Message Pack) or None.
+    Returns ``{"ssid": ..., "rid_payload": ...}`` when an ODID message is
+    present, or None otherwise.
     """
     offset = 12  # skip fixed parameters
+    ssid = ""
     while offset + 2 <= len(body):
         tag_id  = body[offset]
         tag_len = body[offset + 1]
         end     = offset + 2 + tag_len
         if end > len(body):
             break
+        if tag_id == 0:
+            # Parse SSID
+            ssid = body[offset + 2: end].decode("utf-8", errors="replace")
         if tag_id == 221:  # Vendor Specific IE
             info = body[offset + 2: end]
             if len(info) >= 6 and info[:3] == ASTM_OUI and info[3] == ASTM_OUI_TYPE:
-                return info[5:]   # OUI(3) + vendor_type(1) + counter(1)
+                return {
+                    "ssid": ssid,
+                    "rid_payload": info[5:],
+                }   # OUI(3) + vendor_type(1) + counter(1)
         offset = end
     return None
 
@@ -853,11 +864,11 @@ class WiFiFeeder:
 
         # ---- Wi-Fi Beacon Remote ID (subtype 8) ----
         if subtype == 8:
-            rid_payload = _extract_beacon_rid(body)
-            if rid_payload is None:
+            beacon = _extract_beacon_rid(body)
+            if beacon is None:
                 return
 
-            decoded = decode_rid_message(rid_payload)
+            decoded = decode_rid_message(beacon["rid_payload"], beacon["ssid"])
             if decoded is None:
                 return
 
